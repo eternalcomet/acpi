@@ -2521,7 +2521,19 @@ where
                          * write-then-read pattern. We should perform a read in those cases and
                          * return that instead.
                          */
-                        Object::FieldUnit(field_unit) => self.do_field_write(field_unit, object.clone())?,
+                        Object::FieldUnit(field_unit) => {
+                            /*
+                             * Writing to a field can evaluate more AML: accesses to fields in
+                             * PCI_Config regions evaluate the device's `_SEG`/`_BBN`/`_ADR`
+                             * objects, which are allowed to be methods. A method that stores to
+                             * an implicit target (e.g. arithmetic without one) re-enters
+                             * `do_store`, which locks the object token again, so release it for
+                             * the duration of the field write, or we deadlock on it.
+                             */
+                            let field_unit = field_unit.clone();
+                            drop(token);
+                            self.do_field_write(&field_unit, object.clone())?
+                        }
 
                         _ => {
                             return Err(AmlError::InvalidOperationOnObject {
