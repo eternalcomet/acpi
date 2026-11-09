@@ -166,12 +166,12 @@ where
         };
 
         let mut pm1a = self.pm1a.read()?;
-        pm1a.set_bit(control_bit, set);
+        bit_field::BitField::set_bit(&mut pm1a, control_bit, set);
         self.pm1a.write(pm1a)?;
 
         if let Some(pm1b) = &self.pm1b {
             let mut value = pm1b.read()?;
-            value.set_bit(control_bit, set);
+            bit_field::BitField::set_bit(&mut value, control_bit, set);
             pm1b.write(value)?;
         }
 

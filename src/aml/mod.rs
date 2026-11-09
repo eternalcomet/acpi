@@ -143,6 +143,28 @@ const INTERPRETER_REVISION: u64 = 1;
 /// to make us loop forever.
 const MAX_NAME_PATH_INDIRECTIONS: usize = 8;
 
+/// PCI addresses resolved before taking the object token for a field write.
+///
+/// A PCI address can be computed by an AML method. The cache is scoped to one
+/// field operation so that those methods run without the object token, while
+/// the actual field access remains serialized by it.
+#[derive(Default)]
+struct PciAddressCache {
+    addresses: Vec<(AmlName, PciAddress)>,
+}
+
+impl PciAddressCache {
+    fn insert(&mut self, path: AmlName, address: PciAddress) {
+        if !self.addresses.iter().any(|(cached_path, _)| cached_path == &path) {
+            self.addresses.push((path, address));
+        }
+    }
+
+    fn get(&self, path: &AmlName) -> Option<PciAddress> {
+        self.addresses.iter().find(|(cached_path, _)| cached_path == path).map(|(_, address)| *address)
+    }
+}
+
 // The following constants are public as they are referenced from the AmlError docs.
 /// How many nested function calls should we allow? This is a fairly arbitrary figure that could be
 /// changed with experience if it proves too small.
@@ -415,8 +437,8 @@ where
              * owned.
              */
             let mut new_value = global_lock;
-            new_value.set_bit(0, is_owned);
-            new_value.set_bit(1, true);
+            bit_field::BitField::set_bit(&mut new_value, 0, is_owned);
+            bit_field::BitField::set_bit(&mut new_value, 1, true);
 
             if facs
                 .global_lock
@@ -457,8 +479,8 @@ where
             let global_lock = facs.global_lock.load(Ordering::Relaxed);
             let is_pending = global_lock.get_bit(0);
             let mut new_value = global_lock;
-            new_value.set_bit(0, false);
-            new_value.set_bit(1, false);
+            bit_field::BitField::set_bit(&mut new_value, 0, false);
+            bit_field::BitField::set_bit(&mut new_value, 1, false);
 
             if facs
                 .global_lock
@@ -521,15 +543,14 @@ where
                         let operand = operand.clone().unwrap_reference();
                         let token = self.object_token.lock();
 
-                        let operand = unsafe {operand.gain_mut(&token)};
+                        let operand = unsafe { operand.gain_mut(&token) };
                         let value = match operand {
-                            Object::Integer(operand) => {
-                                *operand
-                            }
-                            Object::BufferField{..} => {
-                                operand.to_integer(self.integer_size)?
-                            }
-                            _ => Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::Integer, got: operand.typ() })?
+                            Object::Integer(operand) => *operand,
+                            Object::BufferField { .. } => operand.to_integer(self.integer_size)?,
+                            _ => Err(AmlError::ObjectNotOfExpectedType {
+                                expected: ObjectType::Integer,
+                                got: operand.typ(),
+                            })?,
                         };
 
                         let new_value = match op.op {
@@ -542,10 +563,10 @@ where
                             Object::Integer(operand) => {
                                 *operand = new_value;
                             }
-                            Object::BufferField{..} => {
+                            Object::BufferField { .. } => {
                                 operand.write_buffer_field(&new_value.to_le_bytes(), &token)?;
                             }
-                            _ => unreachable!()
+                            _ => unreachable!(),
                         }
 
                         context.contribute_arg(Argument::Object(Object::Integer(new_value).wrap()));
@@ -2486,6 +2507,28 @@ where
     /// [`Object::unwrap_ref_for_store`]!
     fn do_store(&self, target: WrappedObject, object: WrappedObject) -> Result<WrappedObject, AmlError> {
         let object = object.unwrap_transparent_reference();
+
+        /*
+         * A PCI_Config field access may evaluate _SEG, _BBN, or _ADR. Resolve every PCI
+         * region reachable from the field before taking the object token, because those
+         * objects may be methods that perform stores of their own.
+         */
+        let field_write_addresses = match &*target {
+            Object::Reference { .. } => {
+                let (target_object, implicit_cast_reqd) = target.clone().unwrap_ref_for_store()?;
+                if implicit_cast_reqd {
+                    if let Object::FieldUnit(field_unit) = &*target_object {
+                        Some(self.pci_addresses_for_field(field_unit)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         let token = self.object_token.lock();
 
         match unsafe { target.gain_mut(&token) } {
@@ -2522,17 +2565,12 @@ where
                          * return that instead.
                          */
                         Object::FieldUnit(field_unit) => {
-                            /*
-                             * Writing to a field can evaluate more AML: accesses to fields in
-                             * PCI_Config regions evaluate the device's `_SEG`/`_BBN`/`_ADR`
-                             * objects, which are allowed to be methods. A method that stores to
-                             * an implicit target (e.g. arithmetic without one) re-enters
-                             * `do_store`, which locks the object token again, so release it for
-                             * the duration of the field write, or we deadlock on it.
-                             */
-                            let field_unit = field_unit.clone();
-                            drop(token);
-                            self.do_field_write(&field_unit, object.clone())?
+                            let Some(addresses) = field_write_addresses.as_ref() else {
+                                return Err(AmlError::InternalError(
+                                    "PCI addresses were not prepared for a field write".to_string(),
+                                ));
+                            };
+                            self.do_field_write(field_unit, object.clone(), Some(addresses))?
                         }
 
                         _ => {
@@ -2617,7 +2655,7 @@ where
             FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
                 let Object::FieldUnit(ref bank) = **bank else { panic!() };
                 assert!(matches!(bank.kind, FieldUnitKind::Normal { .. }));
-                self.do_field_write(bank, Object::Integer(bank_value).wrap())?;
+                self.do_field_write(bank, Object::Integer(bank_value).wrap(), None)?;
                 (region, 0)
             }
             FieldUnitKind::Index { index: _, ref data } => {
@@ -2656,6 +2694,7 @@ where
                     self.do_field_write(
                         index,
                         Object::Integer((index_field_idx + i * (access_width_bits / 8)) as u64).wrap(),
+                        None,
                     )?;
 
                     // The offset is always that of the data register, as we always read from the
@@ -2664,7 +2703,7 @@ where
                 }
             };
 
-            let raw = self.do_native_region_read(read_region, aligned_offset / 8, access_width_bits / 8)?;
+            let raw = self.do_native_region_read(read_region, aligned_offset / 8, access_width_bits / 8, None)?;
             let src_index = if i == 0 { field.bit_index % access_width_bits } else { 0 };
             let remaining_length = field.bit_length - read_so_far;
             let length = if i == 0 {
@@ -2683,7 +2722,12 @@ where
         }
     }
 
-    fn do_field_write(&self, field: &FieldUnit, value: WrappedObject) -> Result<(), AmlError> {
+    fn do_field_write(
+        &self,
+        field: &FieldUnit,
+        value: WrappedObject,
+        pci_addresses: Option<&PciAddressCache>,
+    ) -> Result<(), AmlError> {
         trace!("AML field write. Field = {:?}. Value = {}", field, value);
 
         let value_bytes = match &*value {
@@ -2702,7 +2746,7 @@ where
             FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
                 let Object::FieldUnit(ref bank) = **bank else { panic!() };
                 assert!(matches!(bank.kind, FieldUnitKind::Normal { .. }));
-                self.do_field_write(bank, Object::Integer(bank_value).wrap())?;
+                self.do_field_write(bank, Object::Integer(bank_value).wrap(), pci_addresses)?;
                 (region, 0)
             }
             FieldUnitKind::Index { index: _, ref data } => {
@@ -2713,6 +2757,7 @@ where
             }
         };
         let Object::OpRegion(ref write_region) = **write_region else { panic!() };
+        let pci_address = self.pci_address_for_region(write_region, pci_addresses)?;
 
         // TODO: if the region wants locking, do that
 
@@ -2736,6 +2781,7 @@ where
                     self.do_field_write(
                         index,
                         Object::Integer((index_field_idx + i * (access_width_bits / 8)) as u64).wrap(),
+                        pci_addresses,
                     )?;
 
                     // The offset is always that of the data register, as we always read from the
@@ -2753,7 +2799,12 @@ where
             let mut bytes = if dst_index > 0 || (field.bit_length - written_so_far) < access_width_bits {
                 match field.flags.update_rule() {
                     FieldUpdateRule::Preserve => self
-                        .do_native_region_read(write_region, aligned_offset / 8, access_width_bits / 8)?
+                        .do_native_region_read(
+                            write_region,
+                            aligned_offset / 8,
+                            access_width_bits / 8,
+                            pci_address,
+                        )?
                         .to_le_bytes(),
                     FieldUpdateRule::WriteAsOnes => [0xff; 8],
                     FieldUpdateRule::WriteAsZeros => [0; 8],
@@ -2775,6 +2826,7 @@ where
                 aligned_offset / 8,
                 access_width_bits / 8,
                 u64::from_le_bytes(bytes),
+                pci_address,
             )?;
             written_so_far += length;
         }
@@ -2785,7 +2837,13 @@ where
     /// Performs an actual read from an operation region. `offset` and `length` must respect the
     /// access requirements of the field being read, and are supplied in **bytes**. This may call
     /// AML methods if required, and may invoke user-supplied handlers.
-    fn do_native_region_read(&self, region: &OpRegion, offset: usize, length: usize) -> Result<u64, AmlError> {
+    fn do_native_region_read(
+        &self,
+        region: &OpRegion,
+        offset: usize,
+        length: usize,
+        pci_address: Option<PciAddress>,
+    ) -> Result<u64, AmlError> {
         trace!("Native field read. Region = {:?}, offset = {:#x}, length={:#x}", region, offset, length);
 
         match region.space {
@@ -2809,7 +2867,10 @@ where
                 }
             }),
             RegionSpace::PciConfig => {
-                let address = self.pci_address_for_device(&region.parent_device_path)?;
+                let address = match pci_address {
+                    Some(address) => address,
+                    None => self.pci_address_for_device(&region.parent_device_path)?,
+                };
                 let offset = region.base as u16 + offset as u16;
                 match length {
                     1 => Ok(self.handler.read_pci_u8(address, offset) as u64),
@@ -2847,6 +2908,7 @@ where
         offset: usize,
         length: usize,
         value: u64,
+        pci_address: Option<PciAddress>,
     ) -> Result<(), AmlError> {
         trace!(
             "Native field write. Region = {:?}, offset = {:#x}, length={:#x}, value={:#x}",
@@ -2876,7 +2938,10 @@ where
                 Ok(())
             }
             RegionSpace::PciConfig => {
-                let address = self.pci_address_for_device(&region.parent_device_path)?;
+                let address = match pci_address {
+                    Some(address) => address,
+                    None => self.pci_address_for_device(&region.parent_device_path)?,
+                };
                 let offset = region.base as u16 + offset as u16;
                 match length {
                     1 => self.handler.write_pci_u8(address, offset, value as u8),
@@ -2903,6 +2968,59 @@ where
                     Err(AmlError::NoHandlerForRegionAccess(region.space))
                 }
             }
+        }
+    }
+
+    fn pci_addresses_for_field(&self, field: &FieldUnit) -> Result<PciAddressCache, AmlError> {
+        let mut addresses = PciAddressCache::default();
+        self.collect_pci_addresses(field, &mut addresses)?;
+        Ok(addresses)
+    }
+
+    fn collect_pci_addresses(&self, field: &FieldUnit, addresses: &mut PciAddressCache) -> Result<(), AmlError> {
+        match &field.kind {
+            FieldUnitKind::Normal { region } => self.collect_pci_address(region, addresses),
+            FieldUnitKind::Bank { region, bank, .. } => {
+                let Object::FieldUnit(bank) = &**bank else { panic!() };
+                self.collect_pci_addresses(bank, addresses)?;
+                self.collect_pci_address(region, addresses)
+            }
+            FieldUnitKind::Index { index, data } => {
+                let Object::FieldUnit(index) = &**index else { panic!() };
+                let Object::FieldUnit(data) = &**data else { panic!() };
+                self.collect_pci_addresses(data, addresses)?;
+                self.collect_pci_addresses(index, addresses)
+            }
+        }
+    }
+
+    fn collect_pci_address(
+        &self,
+        region_object: &WrappedObject,
+        addresses: &mut PciAddressCache,
+    ) -> Result<(), AmlError> {
+        let Object::OpRegion(region) = &**region_object else { panic!() };
+        if region.space == RegionSpace::PciConfig {
+            let address = self.pci_address_for_device(&region.parent_device_path)?;
+            addresses.insert(region.parent_device_path.clone(), address);
+        }
+        Ok(())
+    }
+
+    fn pci_address_for_region(
+        &self,
+        region: &OpRegion,
+        addresses: Option<&PciAddressCache>,
+    ) -> Result<Option<PciAddress>, AmlError> {
+        if region.space != RegionSpace::PciConfig {
+            return Ok(None);
+        }
+
+        match addresses {
+            Some(addresses) => addresses.get(&region.parent_device_path).map(Some).ok_or_else(|| {
+                AmlError::InternalError("PCI address was not prepared for a field region".to_string())
+            }),
+            None => self.pci_address_for_device(&region.parent_device_path).map(Some),
         }
     }
 
